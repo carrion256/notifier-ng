@@ -1,0 +1,24 @@
+notifier-ng
+
+Copyright (C) 2026 notifier-ng contributors
+
+SPDX-License-Identifier: GPL-3.0-only
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License version 3 as published by the Free
+Software Foundation.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License (see the LICENSE
+file) for more details.
+
+Dependencies
+
+- Core: Python standard library only. The Python scripts have no third-party
+  dependencies, and no dependency source is vendored in this repository.
+- Optional OMP integration (integrations/omp-notifier.ts): TypeScript source
+  hosted and executed by the OMP harness. It requires the Bun JavaScript
+  runtime, the harness's @oh-my-pi/pi-coding-agent extension API as a peer
+  dependency, and a local Python 3 interpreter for the scripts it invokes.
+  No dependency source is vendored in this repository.

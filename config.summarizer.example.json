@@ -1,0 +1,33 @@
+{
+  "include_message_text": true,
+  "allow_remote_context": true,
+  "summarizer": {
+    "command": [
+      "<path-to-checkout>/summarizers/openai_compatible.py"
+    ],
+    "timeout_seconds": 20,
+    "last_items": 6,
+    "max_item_chars": 1200,
+    "max_context_chars": 5000,
+    "max_summary_chars": 450,
+    "max_summary_output_bytes": 4096,
+    "states": [
+      "idle"
+    ]
+  },
+  "transports": [
+    {
+      "id": "home-assistant",
+      "type": "home_assistant",
+      "url": "https://home-assistant.example.invalid",
+      "token_env": "HASS_TOKEN",
+      "service": "mobile_app_your_device"
+    },
+    {
+      "id": "ntfy",
+      "type": "ntfy",
+      "url": "https://ntfy.example.invalid/notifier-ng",
+      "token_env": "NTFY_API_KEY"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "include_message_text": false,
+  "allow_remote_context": false,
+  "transports": [
+    {
+      "id": "home-assistant",
+      "type": "home_assistant",
+      "url": "https://home-assistant.example.invalid",
+      "token_env": "HASS_TOKEN",
+      "service": "mobile_app_your_device"
+    },
+    {
+      "id": "ntfy",
+      "type": "ntfy",
+      "url": "https://ntfy.example.invalid/notifier-ng",
+      "token_env": "NTFY_API_KEY"
+    }
+  ]
+}
