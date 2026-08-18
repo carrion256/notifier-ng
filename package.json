@@ -2,6 +2,26 @@
   "name": "notifier-ng",
   "private": true,
   "type": "module",
+  "description": "Pluggable idle-event notifier with durable deduplication (Python standard-library core; optional Bun / Oh My Pi extension adapter).",
+  "homepage": "https://github.com/carrion256/notifier-ng",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/carrion256/notifier-ng.git"
+  },
+  "bugs": {
+    "url": "https://github.com/carrion256/notifier-ng/issues"
+  },
+  "keywords": [
+    "notifications",
+    "notifier",
+    "idle",
+    "ndjson",
+    "plugin",
+    "deduplication",
+    "bun",
+    "oh-my-pi"
+  ],
+  "author": "notifier-ng contributors",
   "license": "GPL-3.0-only",
   "engines": {
     "bun": ">=1.0.0"
