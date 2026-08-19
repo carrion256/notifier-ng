@@ -13,7 +13,10 @@ the suite is fully deterministic.
 Run as:  python3 test_notifier_ng.py
 """
 
+import contextlib
 import datetime
+import hashlib
+import io
 import json
 import os
 import shutil
@@ -24,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -1045,6 +1049,1236 @@ else:
 
 
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# nzm plugin (frozen V9 adapter: robot lifecycle + activity evidence)
+# ---------------------------------------------------------------------------
+
+FAKE_NZM = """\
+import json, os, sys
+with open(os.environ["FAKE_NZM_ARGS"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+cmd = tuple(sys.argv[1:3])
+if cmd == ("robot", "snapshot"):
+    sys.stdout.write(os.environ.get("FAKE_NZM_ROBOT", ""))
+    sys.stderr.write(os.environ.get("FAKE_NZM_ROBOT_ERR", ""))
+    sys.exit(int(os.environ.get("FAKE_NZM_ROBOT_RC", "0")))
+if cmd == ("activity", "snapshot"):
+    sys.stdout.write(os.environ.get("FAKE_NZM_ACTIVITY", ""))
+    sys.stderr.write(os.environ.get("FAKE_NZM_ACTIVITY_ERR", ""))
+    sys.exit(int(os.environ.get("FAKE_NZM_ACTIVITY_RC", "0")))
+sys.stderr.write("unrecognized nzm subcommand: %r\\n" % (sys.argv[1:],))
+sys.exit(2)
+"""
+
+# Canonical activity fixture copied byte-for-byte from the NZM repository
+# (tests/fixtures/activity_snapshot_v1.json); the SHA-256 is pinned by the
+# V9 plan and asserted below so any drift in this copy fails loudly.
+NZM_ACTIVITY_FIXTURE_SHA256 = "fb9bda19d58532e1393baeb668c3590a84e4474c1d0c30c48d9fc98e0fa70fe7"
+NZM_ACTIVITY_FIXTURE = '{"version":1,"generated_at":"2026-08-19T09:30:00Z","agents":[{"subject":"proj:cc_1","session":"proj","agent_label":"cc_1","agent_type":"claude-code","probe":"observed","signal":"screen_observed","observed_at":"2026-08-19T09:30:00Z","screen_hash":"444021d1f31080fa","zellij_pane_id":7,"lifecycle":"running","detail":null},{"subject":"proj:cod_0","session":"proj","agent_label":"cod_0","agent_type":"codex","probe":"unknown","signal":"probe_failed","observed_at":"2026-08-19T09:30:00Z","screen_hash":null,"zellij_pane_id":null,"lifecycle":"running","detail":"agent has no bound zellij pane"},{"subject":"proj:gemini_0","session":"proj","agent_label":"gemini_0","agent_type":"gemini","probe":"unknown","signal":"lifecycle","observed_at":"2026-08-19T09:30:00Z","screen_hash":null,"zellij_pane_id":12,"lifecycle":"error","detail":null},{"subject":"demo:cc_0","session":"demo","agent_label":"cc_0","agent_type":"claude-code","probe":"unknown","signal":"lifecycle","observed_at":"2026-08-19T09:30:00Z","screen_hash":null,"zellij_pane_id":null,"lifecycle":"stopped","detail":null}]}\n'
+
+
+class NzmPluginTests(NzBaseTestCase):
+    PLUGIN = "nzm.py"
+
+    def run_pass(self, ts, robot, activity=None, *, raw_activity=None, quiet=900, extra_env=None):
+        """One plugin run as a real subprocess with the fake nzm on PATH."""
+        bin_dir = ts.path("bin")
+        write_script(bin_dir / "nzm", FAKE_NZM)
+        args_file = ts.path("fake-nzm-args.ndjson")
+        env = env_with(
+            PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
+            FAKE_NZM_ARGS=str(args_file),
+            FAKE_NZM_ROBOT=json.dumps(robot, separators=(",", ":")),
+            FAKE_NZM_ACTIVITY=(
+                raw_activity
+                if raw_activity is not None
+                else json.dumps(activity, separators=(",", ":"))
+            ),
+            XDG_STATE_HOME=str(ts.path("state")),
+            NZM_QUIET_SECONDS=str(quiet),
+        )
+        if extra_env:
+            env.update({k: str(v) for k, v in extra_env.items()})
+        proc = subprocess.run(
+            [sys.executable, str(PLUGINS / self.PLUGIN)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        recorded = (
+            [
+                json.loads(line)
+                for line in args_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if args_file.exists()
+            else []
+        )
+        return proc, recorded
+
+    def state_path(self, ts):
+        return ts.path("state", "notifier-ng", "nzm-activity.json")
+
+    def lock_path(self, ts):
+        return ts.path("state", "notifier-ng", "nzm-activity.json.lock")
+
+    def read_state(self, ts):
+        return json.loads(self.state_path(ts).read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _uuid(label):
+        digest = hashlib.sha1(f"nzm:{label}".encode()).hexdigest()[:32]
+        return f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+
+    def robot_agent(self, label, *, session, status="Idle", pane_id=None, agent_type="claude-code"):
+        return {
+            "id": self._uuid(session + ":" + label),
+            "label": label,
+            "agent_type": agent_type,
+            "status": status,
+            "zellij_pane_id": pane_id,
+            "session_name": session,
+            "created_at": "2026-08-18T10:00:00+00:00",
+        }
+
+    def robot_snapshot(self, sessions):
+        return {"snapshot": {"generated_at": "2026-08-19T09:00:00Z", "sessions": sessions}}
+
+    def robot_session(self, name, *agents, status="running"):
+        return {
+            "name": name,
+            "status": status,
+            "layout_path": None,
+            "created_at": "2026-08-18T10:00:00+00:00",
+            "agents": list(agents),
+        }
+
+    def activity_agent(
+        self,
+        subject,
+        *,
+        session=None,
+        label=None,
+        agent_type="claude-code",
+        probe="observed",
+        signal="screen_observed",
+        observed_at="2026-08-19T09:00:00Z",
+        screen_hash="aaaaaaaaaaaaaaaa",
+        pane_id=None,
+        lifecycle="running",
+        detail=None,
+    ):
+        parts = subject.split(":", 1)
+        if session is None:
+            session = parts[0]
+        if label is None:
+            label = parts[1]
+        return {
+            "subject": subject,
+            "session": session,
+            "agent_label": label,
+            "agent_type": agent_type,
+            "probe": probe,
+            "signal": signal,
+            "observed_at": observed_at,
+            "screen_hash": screen_hash,
+            "zellij_pane_id": pane_id,
+            "lifecycle": lifecycle,
+            "detail": detail,
+        }
+
+    def activity_snapshot(self, agents, generated_at="2026-08-19T09:00:00Z"):
+        return {"version": 1, "generated_at": generated_at, "agents": list(agents)}
+
+    def robot_one_running(self, status="Idle"):
+        agent = self.robot_agent("cc_1", session="proj", status=status, pane_id=7)
+        return self.robot_snapshot([self.robot_session("proj", agent)])
+
+    def assertNoRecords(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "", proc.stdout)
+
+    def test_fixture_copy_sha256_and_length_match_canonical(self):
+        body = NZM_ACTIVITY_FIXTURE.encode("utf-8")
+        self.assertEqual(hashlib.sha256(body).hexdigest(), NZM_ACTIVITY_FIXTURE_SHA256)
+        self.assertEqual(len(body), 1075, "fixture copy must stay byte-identical")
+        self.assertTrue(body.endswith(b"\n"), "fixture copy must keep its trailing newline")
+        parsed = json.loads(body)
+        self.assertEqual(parsed["version"], 1)
+        self.assertEqual(parsed["generated_at"], "2026-08-19T09:30:00Z")
+        self.assertEqual(len(parsed["agents"]), 4)
+        self.assertEqual(
+            {a["subject"] for a in parsed["agents"]},
+            {"proj:cc_1", "proj:cod_0", "proj:gemini_0", "demo:cc_0"},
+        )
+
+    def test_canonical_fixture_run_emits_lifecycle_override_in_order(self):
+        # Robot snapshot mirroring the canonical evidence: session proj is
+        # running (cc_1 Idle, cod_0 Busy, gemini_0 Error) and session demo is
+        # stopped (cc_0 Idle) -- the frozen session-stopped-overrides-all rule.
+        robot = self.robot_snapshot(
+            [
+                self.robot_session(
+                    "proj",
+                    self.robot_agent("cc_1", session="proj", pane_id=7),
+                    self.robot_agent("cod_0", session="proj", status="Busy", pane_id=None),
+                    self.robot_agent("gemini_0", session="proj", status="Error", pane_id=12),
+                ),
+                self.robot_session(
+                    "demo",
+                    self.robot_agent("cc_0", session="demo", status="Idle", pane_id=None),
+                    status="stopped",
+                ),
+            ]
+        )
+        with TempState() as ts:
+            # Feed the true canonical bytes verbatim (no re-serialization).
+            proc, recorded = self.run_pass(
+                ts, robot, raw_activity=NZM_ACTIVITY_FIXTURE, quiet=900
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                recorded,
+                [["robot", "snapshot"], ["activity", "snapshot"]],
+                "nzm must be queried lifecycle-first with the frozen argv",
+            )
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 2, proc.stdout)
+            rec1, rec2 = records
+            self.assertRecord(
+                rec1,
+                source="nzm",
+                subject="proj:gemini_0",
+                state="error",
+                mode="snapshot",
+            )
+            self.assertEqual(
+                rec1["metadata"],
+                {
+                    "robot_status": "Error",
+                    "session_status": "running",
+                    "probe": "unknown",
+                    "evidence_signal": "lifecycle",
+                    "lifecycle": "error",
+                    "observed_at": "2026-08-19T09:30:00Z",
+                    "generated_at": "2026-08-19T09:30:00Z",
+                    "pane_id": 12,
+                },
+            )
+            self.assertRecord(
+                rec2,
+                source="nzm",
+                subject="demo:cc_0",
+                state="stopped",
+                mode="snapshot",
+            )
+            self.assertEqual(
+                rec2["metadata"],
+                {
+                    "robot_status": "Idle",
+                    "session_status": "stopped",
+                    "probe": "unknown",
+                    "evidence_signal": "lifecycle",
+                    "lifecycle": "stopped",
+                    "observed_at": "2026-08-19T09:30:00Z",
+                    "generated_at": "2026-08-19T09:30:00Z",
+                },
+            )
+            state = self.read_state(ts)
+            self.assertEqual(sorted(state["agents"]), ["demo:cc_0", "proj:cc_1", "proj:gemini_0"])
+            self.assertEqual(
+                state["agents"]["proj:cc_1"],
+                {
+                    "screen_hash": "444021d1f31080fa",
+                    "hash_seen_at": "2026-08-19T09:30:00+00:00",
+                    "emitted": None,
+                },
+            )
+            self.assertEqual(
+                state["agents"]["proj:gemini_0"],
+                {"screen_hash": None, "hash_seen_at": None, "emitted": "error"},
+            )
+            self.assertNotIn("proj:cod_0", state["agents"], "unknown probes must not write state")
+            # Persisting notifiable states re-emit every run (core dedups
+            # delivery); the baselined agent stays silent below the threshold.
+            proc2, _ = self.run_pass(ts, robot, raw_activity=NZM_ACTIVITY_FIXTURE, quiet=900)
+            self.assertEqual(proc2.returncode, 0, proc2.stderr)
+            self.assertEqual(len(parse_ndjson(proc2.stdout)), 2, proc2.stdout)
+
+    def test_baseline_quiet_duplicate_rearm_cycle(self):
+        robot = self.robot_one_running()
+        with TempState() as ts:
+            # Pass 1: first observation baselines as active without delivery.
+            act = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        observed_at="2026-08-19T09:00:00Z",
+                        screen_hash="1111111111111111",
+                        pane_id=7,
+                    )
+                ],
+                generated_at="2026-08-19T09:00:00Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertNoRecords(proc)
+            self.assertEqual(
+                self.state_path(ts).read_text(encoding="utf-8"),
+                '{"version":1,"agents":{"proj:cc_1":{"screen_hash":"1111111111111111",'
+                '"hash_seen_at":"2026-08-19T09:00:00+00:00","emitted":null}}}',
+            )
+            # Pass 2: unchanged hash below NZM_QUIET_SECONDS stays silent.
+            act = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        observed_at="2026-08-19T09:00:30Z",
+                        screen_hash="1111111111111111",
+                        pane_id=7,
+                    )
+                ],
+                generated_at="2026-08-19T09:00:30Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertNoRecords(proc)
+            # Pass 3: unchanged hash crossing 60s emits idle quiet_only once.
+            act = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        observed_at="2026-08-19T09:01:00Z",
+                        screen_hash="1111111111111111",
+                        pane_id=7,
+                    )
+                ],
+                generated_at="2026-08-19T09:01:00Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertRecord(
+                records[0],
+                source="nzm",
+                subject="proj:cc_1",
+                state="idle",
+                mode="snapshot",
+            )
+            self.assertEqual(
+                records[0]["metadata"],
+                {
+                    "robot_status": "Idle",
+                    "session_status": "running",
+                    "probe": "observed",
+                    "evidence_signal": "screen_observed",
+                    "lifecycle": "running",
+                    "observed_at": "2026-08-19T09:01:00Z",
+                    "generated_at": "2026-08-19T09:01:00Z",
+                    "screen_hash": "1111111111111111",
+                    "pane_id": 7,
+                    "signal": "quiet_only",
+                    "quiet_for_seconds": 60,
+                    "quiet_threshold": 60,
+                    "quiet_since": "2026-08-19T09:00:00+00:00",
+                },
+            )
+            # Pass 4: duplicate quiet re-emits the same state/fingerprint with
+            # the current accumulated quiet evidence (core dedups delivery).
+            act = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        observed_at="2026-08-19T09:01:30Z",
+                        screen_hash="1111111111111111",
+                        pane_id=7,
+                    )
+                ],
+                generated_at="2026-08-19T09:01:30Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertRecord(
+                records[0],
+                source="nzm",
+                subject="proj:cc_1",
+                state="idle",
+                mode="snapshot",
+            )
+            self.assertEqual(records[0]["metadata"]["signal"], "quiet_only")
+            self.assertEqual(records[0]["metadata"]["quiet_for_seconds"], 90)
+            # Pass 5: changed hash rearms active and resets the quiet clock.
+            act = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        observed_at="2026-08-19T09:02:00Z",
+                        screen_hash="2222222222222222",
+                        pane_id=7,
+                    )
+                ],
+                generated_at="2026-08-19T09:02:00Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertRecord(
+                records[0],
+                source="nzm",
+                subject="proj:cc_1",
+                state="active",
+                mode="snapshot",
+            )
+            self.assertEqual(
+                records[0]["metadata"]["quiet_for_seconds"],
+                0,
+                "rearm resets the quiet accumulator",
+            )
+            self.assertEqual(
+                records[0]["metadata"]["quiet_since"],
+                "2026-08-19T09:02:00+00:00",
+            )
+            self.assertNotIn("signal", records[0]["metadata"])
+            self.assertEqual(self.read_state(ts)["agents"]["proj:cc_1"]["emitted"], "active")
+            # Pass 6: new hash unchanged below threshold stays silent.
+            act = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        observed_at="2026-08-19T09:02:30Z",
+                        screen_hash="2222222222222222",
+                        pane_id=7,
+                    )
+                ],
+                generated_at="2026-08-19T09:02:30Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertNoRecords(proc)
+            # Pass 7: second quiet period crosses and delivers idle once again.
+            act = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        observed_at="2026-08-19T09:03:00Z",
+                        screen_hash="2222222222222222",
+                        pane_id=7,
+                    )
+                ],
+                generated_at="2026-08-19T09:03:00Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertEqual(records[0]["state"], "idle")
+            self.assertEqual(records[0]["metadata"]["quiet_for_seconds"], 60)
+            self.assertEqual(
+                records[0]["metadata"]["quiet_since"],
+                "2026-08-19T09:02:00+00:00",
+            )
+
+    def test_active_screen_churn_stays_silent(self):
+        robot = self.robot_one_running()
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+                ),
+                quiet=60,
+            )
+            self.assertNoRecords(proc)  # baseline
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [
+                        self.activity_agent(
+                            "proj:cc_1",
+                            observed_at="2026-08-19T09:01:00Z",
+                            screen_hash="bbbbbbbbbbbbbbbb",
+                            pane_id=7,
+                        )
+                    ]
+                ),
+                quiet=60,
+            )
+            self.assertEqual(len(parse_ndjson(proc.stdout)), 1, proc.stdout)  # rearm -> active
+            # A further hash change while already active is routine screen
+            # churn: the clock resets but no duplicate active is emitted.
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [
+                        self.activity_agent(
+                            "proj:cc_1",
+                            observed_at="2026-08-19T09:01:30Z",
+                            screen_hash="cccccccccccccccc",
+                            pane_id=7,
+                        )
+                    ]
+                ),
+                quiet=60,
+            )
+            self.assertNoRecords(proc)
+            self.assertEqual(
+                self.read_state(ts)["agents"]["proj:cc_1"]["screen_hash"],
+                "cccccccccccccccc",
+                "churn must still reset the stored screen evidence",
+            )
+
+    def test_unknown_probe_emits_nothing_and_preserves_hysteresis(self):
+        robot = self.robot_one_running()
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+                ),
+                quiet=60,
+            )
+            self.assertNoRecords(proc)
+            before = self.state_path(ts).read_bytes()
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [
+                        self.activity_agent(
+                            "proj:cc_1",
+                            probe="unknown",
+                            signal="probe_failed",
+                            observed_at="2026-08-19T09:05:00Z",
+                            screen_hash=None,
+                            pane_id=None,
+                            detail="pane 7: dump failed",
+                        )
+                    ],
+                    generated_at="2026-08-19T09:05:00Z",
+                ),
+                quiet=60,
+            )
+            self.assertNoRecords(proc)
+            self.assertEqual(
+                self.state_path(ts).read_bytes(),
+                before,
+                "unknown probe evidence must leave hysteresis state untouched",
+            )
+            # Evidence gap does not reset the quiet clock: the same screen
+            # hash, observed later, still crosses based on its first sighting.
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [
+                        self.activity_agent(
+                            "proj:cc_1",
+                            observed_at="2026-08-19T09:06:00Z",
+                            pane_id=7,
+                        )
+                    ],
+                    generated_at="2026-08-19T09:06:00Z",
+                ),
+                quiet=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertEqual(records[0]["state"], "idle")
+            self.assertEqual(records[0]["metadata"]["quiet_for_seconds"], 360)
+
+    def test_stopped_error_reemit_and_revival_rearm(self):
+        robot = self.robot_snapshot(
+            [self.robot_session("proj", self.robot_agent("cc_1", session="proj", status="Stopped"))]
+        )
+        act = self.activity_snapshot(
+            [
+                self.activity_agent(
+                    "proj:cc_1",
+                    probe="unknown",
+                    signal="lifecycle",
+                    observed_at="2026-08-19T09:00:00Z",
+                    screen_hash=None,
+                    lifecycle="stopped",
+                )
+            ]
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertRecord(records[0], source="nzm", subject="proj:cc_1", state="stopped", mode="snapshot")
+            self.assertEqual(records[0]["metadata"]["robot_status"], "Stopped")
+            self.assertEqual(records[0]["metadata"]["lifecycle"], "stopped")
+            # Same lifecycle next run: re-emitted (core dedups to one delivery).
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertEqual(len(parse_ndjson(proc.stdout)), 1, proc.stdout)
+            # Revival: an observed screen rearm emits active.
+            robot = self.robot_one_running()
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:01:00Z", pane_id=7)]
+                ),
+                quiet=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertRecord(records[0], source="nzm", subject="proj:cc_1", state="active", mode="snapshot")
+            # Error path behaves identically; metadata keeps raw lifecycle.
+            robot = self.robot_snapshot(
+                [self.robot_session("proj", self.robot_agent("cc_1", session="proj", status="Error"))]
+            )
+            act_err = self.activity_snapshot(
+                [
+                    self.activity_agent(
+                        "proj:cc_1",
+                        probe="unknown",
+                        signal="lifecycle",
+                        observed_at="2026-08-19T09:02:00Z",
+                        screen_hash=None,
+                        pane_id=12,
+                        lifecycle="error",
+                    )
+                ],
+                generated_at="2026-08-19T09:02:00Z",
+            )
+            proc, _ = self.run_pass(ts, robot, act_err, quiet=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertRecord(records[0], source="nzm", subject="proj:cc_1", state="error", mode="snapshot")
+            self.assertEqual(records[0]["metadata"]["robot_status"], "Error")
+            self.assertEqual(records[0]["metadata"]["pane_id"], 12)
+
+    def test_session_stopped_overrides_error_agent(self):
+        robot = self.robot_snapshot(
+            [
+                self.robot_session(
+                    "proj",
+                    self.robot_agent("cc_1", session="proj", status="Error"),
+                    status="stopped",
+                )
+            ]
+        )
+        act = self.activity_snapshot(
+            [
+                self.activity_agent(
+                    "proj:cc_1",
+                    probe="unknown",
+                    signal="lifecycle",
+                    observed_at="2026-08-19T09:00:00Z",
+                    screen_hash=None,
+                    lifecycle="error",
+                )
+            ]
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertRecord(records[0], source="nzm", subject="proj:cc_1", state="stopped", mode="snapshot")
+            self.assertEqual(
+                records[0]["metadata"],
+                {
+                    "robot_status": "Error",
+                    "session_status": "stopped",
+                    "probe": "unknown",
+                    "evidence_signal": "lifecycle",
+                    "lifecycle": "error",
+                    "observed_at": "2026-08-19T09:00:00Z",
+                    "generated_at": "2026-08-19T09:00:00Z",
+                },
+            )
+
+    def test_robot_unknown_status_runs_probe_path(self):
+        # Frozen mapping: robot Idle|Busy|Waiting|Unknown all map to the
+        # active/probe-driven decision, not to a lifecycle notification.
+        robot = self.robot_one_running(status="Unknown")
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+                ),
+                quiet=60,
+            )
+            self.assertNoRecords(proc)  # baseline regardless of robot Unknown
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [
+                        self.activity_agent(
+                            "proj:cc_1",
+                            observed_at="2026-08-19T09:01:00Z",
+                            pane_id=7,
+                        )
+                    ],
+                    generated_at="2026-08-19T09:01:00Z",
+                ),
+                quiet=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            records = parse_ndjson(proc.stdout)
+            self.assertEqual(len(records), 1, proc.stdout)
+            self.assertEqual(records[0]["state"], "idle")
+            self.assertEqual(records[0]["metadata"]["robot_status"], "Unknown")
+
+    def test_zero_agents_succeeds(self):
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_snapshot([]),
+                self.activity_snapshot([]),
+                quiet=60,
+            )
+            self.assertNoRecords(proc)
+            self.assertEqual(self.read_state(ts), {"version": 1, "agents": {}})
+
+    def test_lock_file_is_stable_and_state_write_atomic(self):
+        with TempState() as ts:
+            robot = self.robot_one_running()
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+                ),
+                quiet=60,
+            )
+            self.assertNoRecords(proc)
+            lock = self.lock_path(ts)
+            self.assertTrue(lock.exists(), "flock target must be created alongside the state")
+            first_inode = lock.stat().st_ino
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [
+                        self.activity_agent(
+                            "proj:cc_1",
+                            observed_at="2026-08-19T09:02:00Z",
+                            pane_id=7,
+                        )
+                    ],
+                    generated_at="2026-08-19T09:02:00Z",
+                ),
+                quiet=60,
+            )
+            self.assertEqual(len(parse_ndjson(proc.stdout)), 1, proc.stdout)
+            self.assertTrue(lock.exists())
+            self.assertEqual(
+                lock.stat().st_ino,
+                first_inode,
+                "the lock file must never be replaced or removed",
+            )
+            state = self.read_state(ts)
+            self.assertEqual(state["agents"]["proj:cc_1"]["emitted"], "idle")
+            leftovers = [p.name for p in self.lock_path(ts).parent.iterdir()]
+            self.assertEqual(
+                sorted(leftovers),
+                ["nzm-activity.json", "nzm-activity.json.lock"],
+                "atomic replaces must not leave temp litter",
+            )
+
+    def test_corrupt_state_fails_without_overwrite(self):
+        robot = self.robot_one_running()
+        act = self.activity_snapshot(
+            [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+        )
+        for bad in ('{oops', '{"version":2,"agents":{}}', '{"version":1,"agents":"nope"}'):
+            with TempState() as ts:
+                bad_bytes = bad.encode("utf-8")
+                self.state_path(ts).parent.mkdir(parents=True)
+                self.state_path(ts).write_bytes(bad_bytes)
+                proc, _ = self.run_pass(ts, robot, act, quiet=60)
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("corrupt state file", proc.stderr)
+                self.assertEqual(self.state_path(ts).read_bytes(), bad_bytes)
+
+    def test_missing_nzm_executable_fails(self):
+        with TempState() as ts:
+            empty_bin = ts.path("empty-bin")
+            empty_bin.mkdir()
+            env = env_with(
+                PATH=str(empty_bin),
+                XDG_STATE_HOME=str(ts.path("state")),
+                NZM_QUIET_SECONDS="60",
+            )
+            proc = subprocess.run(
+                [sys.executable, str(PLUGINS / self.PLUGIN)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=SUBPROCESS_TIMEOUT,
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("nzm executable not found on PATH", proc.stderr)
+
+    def test_robot_command_failure_fails_with_empty_stdout(self):
+        robot = self.robot_one_running()
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot([]),
+                quiet=60,
+                extra_env={"FAKE_NZM_ROBOT_RC": "1", "FAKE_NZM_ROBOT_ERR": "registry exploded"},
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "", "a failed probe must not fabricate records")
+        self.assertIn("nzm robot snapshot", proc.stderr)
+        self.assertIn("exited 1", proc.stderr)
+        self.assertIn("registry exploded", proc.stderr)
+
+    def test_activity_command_failure_fails_with_empty_stdout(self):
+        robot = self.robot_one_running()
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot([]),
+                quiet=60,
+                extra_env={
+                    "FAKE_NZM_ACTIVITY_RC": "1",
+                    "FAKE_NZM_ACTIVITY_ERR": "probe failed",
+                },
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("nzm activity snapshot", proc.stderr)
+        self.assertIn("probe failed", proc.stderr)
+
+    def test_robot_non_json_stdout_fails(self):
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_snapshot([]),
+                raw_activity=json.dumps(self.activity_snapshot([]), separators=(",", ":")),
+                quiet=60,
+                extra_env={
+                    "FAKE_NZM_ROBOT": "INFO log prefix then {oops",
+                },
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("not one JSON document", proc.stderr)
+
+    def test_robot_unknown_status_fails(self):
+        robot = self.robot_snapshot(
+            [self.robot_session("proj", self.robot_agent("cc_1", session="proj", status="Zombie"))]
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, robot, self.activity_snapshot([]), quiet=60)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown agent status 'Zombie'", proc.stderr)
+
+    def test_activity_unknown_field_rejected(self):
+        robot = self.robot_one_running()
+        act = self.activity_snapshot(
+            [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+        )
+        act["bogus_envelope"] = 1
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown field(s): bogus_envelope", proc.stderr)
+        act = self.activity_snapshot(
+            [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+        )
+        act["agents"][0]["bogus_agent"] = 1
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, robot, act, quiet=60)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown field(s): bogus_agent", proc.stderr)
+
+    def test_activity_bad_enum_rejected(self):
+        cases = [
+            {"probe": "sometimes"},
+            {"signal": "spooky"},
+            {"lifecycle": "zombie"},
+        ]
+        for bad in cases:
+            agent = self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)
+            agent.update(bad)
+            with TempState() as ts:
+                proc, _ = self.run_pass(
+                    ts,
+                    self.robot_one_running(),
+                    self.activity_snapshot([agent]),
+                    quiet=60,
+                )
+            self.assertEqual(proc.returncode, 1, bad)
+            self.assertIn("unknown", proc.stderr)
+
+    def test_activity_bad_rfc3339_rejected(self):
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_one_running(),
+                {"version": 1, "generated_at": "not-a-timestamp", "agents": []},
+                quiet=60,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("RFC3339", proc.stderr)
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_one_running(),
+                {"version": 1, "generated_at": "2026-08-19T09:00:00+05:30", "agents": []},
+                quiet=60,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("expressed in UTC", proc.stderr)
+        bad = self.activity_agent("proj:cc_1", observed_at="2026-08-19 09:00:00", pane_id=7)
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_one_running(),
+                self.activity_snapshot([bad]),
+                quiet=60,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("RFC3339", proc.stderr)
+
+    def test_activity_bad_screen_hash_rejected(self):
+        agent = self.activity_agent(
+            "proj:cc_1",
+            observed_at="2026-08-19T09:00:00Z",
+            screen_hash="XYZ",
+            pane_id=7,
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, self.robot_one_running(), self.activity_snapshot([agent]), quiet=60)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("screen_hash", proc.stderr)
+
+    def test_evidence_combination_outside_frozen_contract_rejected(self):
+        mixed = self.activity_agent(
+            "proj:cc_1",
+            probe="observed",
+            signal="probe_failed",
+            observed_at="2026-08-19T09:00:00Z",
+            screen_hash="aaaaaaaaaaaaaaaa",
+            pane_id=None,
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, self.robot_one_running(), self.activity_snapshot([mixed]), quiet=60)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("outside the frozen V9 producer contract", proc.stderr)
+        stopped_with_screen = self.activity_agent(
+            "proj:cc_1",
+            probe="observed",
+            signal="screen_observed",
+            observed_at="2026-08-19T09:00:00Z",
+            screen_hash="aaaaaaaaaaaaaaaa",
+            pane_id=7,
+            lifecycle="stopped",
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_one_running(),
+                self.activity_snapshot([stopped_with_screen]),
+                quiet=60,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("outside the frozen V9 producer contract", proc.stderr)
+
+    def test_subject_mismatch_rejected(self):
+        robot = self.robot_one_running()
+        # subject "proj:cc_x" with session=proj / agent_label=cc_1 is
+        # internally inconsistent evidence, rejected before any join check.
+        agent = self.activity_agent(
+            "proj:cc_x", label="cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(ts, robot, self.activity_snapshot([agent]), quiet=60)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("does not match session:agent_label", proc.stderr)
+
+    def test_duplicate_subject_rejected(self):
+        agent = self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_one_running(),
+                self.activity_snapshot([agent, dict(agent)]),
+                quiet=60,
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("duplicate subject 'proj:cc_1'", proc.stderr)
+
+    def test_join_failure_both_directions(self):
+        robot = self.robot_one_running()
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                robot,
+                self.activity_snapshot(
+                    [
+                        self.activity_agent(
+                            "proj:other",
+                            label="other",
+                            observed_at="2026-08-19T09:00:00Z",
+                            pane_id=None,
+                        )
+                    ]
+                ),
+                quiet=60,
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("join failure", proc.stderr)
+        self.assertIn("missing from robot snapshot: proj:other", proc.stderr)
+        stranger = self.robot_session("proj", self.robot_agent("cc_1", session="proj", pane_id=7))
+        stranger["agents"].append(
+            self.robot_agent("extra", session="proj", status="Idle", pane_id=None)
+        )
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_snapshot([stranger]),
+                self.activity_snapshot(
+                    [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+                ),
+                quiet=60,
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("join failure", proc.stderr)
+        self.assertIn("missing from activity: proj:extra", proc.stderr)
+
+    def test_invalid_quiet_seconds_fails(self):
+        robot = self.robot_one_running()
+        act = self.activity_snapshot([])
+        for bad in ("abc", "-5", "60.0"):
+            with TempState() as ts:
+                proc, _ = self.run_pass(ts, robot, act, quiet=bad)
+            self.assertEqual(proc.returncode, 1, bad)
+            self.assertIn("NZM_QUIET_SECONDS must be a non-negative integer", proc.stderr)
+
+    def test_robot_schema_tolerates_extras(self):
+        sessions = [self.robot_session("proj", self.robot_agent("cc_1", session="proj", pane_id=7))]
+        sessions[0]["unexpected_session_field"] = True
+        sessions[0]["agents"][0]["unexpected_agent_field"] = "kept"
+        with TempState() as ts:
+            proc, _ = self.run_pass(
+                ts,
+                self.robot_snapshot(sessions),
+                self.activity_snapshot(
+                    [self.activity_agent("proj:cc_1", observed_at="2026-08-19T09:00:00Z", pane_id=7)]
+                ),
+                quiet=60,
+            )
+        self.assertNoRecords(proc)  # baseline runs fine despite extras
+
+
+class NzmCoreDeliveryTests(unittest.TestCase):
+    """Core CLI E2E: the nzm plugin through `notifier_ng.py source`.
+
+    Plugin-level dedup is intentionally only per fingerprint; the core owns
+    notification delivery state. These tests prove acceptance criterion 5
+    end to end: quiet delivers once, duplicate quiet delivers zero, and
+    stopped delivers exactly once after the core's prime pass.
+    """
+
+    def run_core_pass(
+        self,
+        ts,
+        cfg,
+        state,
+        robot,
+        activity,
+        *,
+        quiet=60,
+    ):
+        bin_dir = ts.path("bin")
+        args_file = ts.path("fake-nzm-args.ndjson")
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("HASS_TOKEN", "HASS_URL", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID")
+        }
+        env["HOME"] = str(ts.path("home"))
+        env["PATH"] = f"{bin_dir}:{Path(sys.executable).resolve().parent}:{os.environ.get('PATH', '')}"
+        env["XDG_STATE_HOME"] = str(ts.path("state"))
+        env["NZM_QUIET_SECONDS"] = str(quiet)
+        env["FAKE_NZM_ARGS"] = str(args_file)
+        env["FAKE_NZM_ROBOT"] = json.dumps(robot, separators=(",", ":"))
+        env["FAKE_NZM_ACTIVITY"] = json.dumps(activity, separators=(",", ":"))
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(CORE),
+                "--config",
+                str(cfg),
+                "--state",
+                str(state),
+                "source",
+                str(PLUGINS / "nzm.py"),
+            ],
+            capture_output=True,
+            env=env,
+            cwd=str(ts.root),
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        return proc
+
+    @staticmethod
+    def _posts(server):
+        return [r for r in server.requests if r["method"] == "POST"]
+
+    def test_core_delivers_quiet_once_duplicate_zero(self):
+        with CaptureServer() as server, TempState() as ts:
+            config = {
+                "include_message_text": True,
+                "transports": [{"type": "ntfy", "id": "ntfy-a", "url": server.url}],
+            }
+            cfg = ts.path("config.json")
+            cfg.write_text(json.dumps(config), encoding="utf-8")
+            state = ts.path("core-state.json")
+            write_script(ts.path("bin") / "nzm", FAKE_NZM)
+            robot = {
+                "snapshot": {
+                    "generated_at": "2026-08-19T09:00:00Z",
+                    "sessions": [
+                        {
+                            "name": "proj",
+                            "status": "running",
+                            "layout_path": None,
+                            "created_at": "2026-08-18T10:00:00+00:00",
+                            "agents": [
+                                {
+                                    "id": "11111111-1111-4111-8111-111111111111",
+                                    "label": "cc_1",
+                                    "agent_type": "claude-code",
+                                    "status": "Idle",
+                                    "zellij_pane_id": 7,
+                                    "session_name": "proj",
+                                    "created_at": "2026-08-18T10:00:00+00:00",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+            passes = [
+                ("2026-08-19T09:00:00Z", "1111111111111111", 0),  # baseline: silent
+                ("2026-08-19T09:01:00Z", "2222222222222222", 0),  # rearm: active primes core
+                ("2026-08-19T09:02:00Z", "2222222222222222", 1),  # crossing: delivers once
+                ("2026-08-19T09:03:00Z", "2222222222222222", 1),  # duplicate quiet: zero more
+                ("2026-08-19T09:04:00Z", "2222222222222222", 1),  # duplicate quiet: zero more
+            ]
+            for index, (observed_at, screen_hash, expected_posts) in enumerate(passes):
+                activity = {
+                    "version": 1,
+                    "generated_at": observed_at,
+                    "agents": [
+                        {
+                            "subject": "proj:cc_1",
+                            "session": "proj",
+                            "agent_label": "cc_1",
+                            "agent_type": "claude-code",
+                            "probe": "observed",
+                            "signal": "screen_observed",
+                            "observed_at": observed_at,
+                            "screen_hash": screen_hash,
+                            "zellij_pane_id": 7,
+                            "lifecycle": "running",
+                            "detail": None,
+                        }
+                    ],
+                }
+                with self.subTest(pass_number=index + 1):
+                    proc = self.run_core_pass(ts, cfg, state, robot, activity)
+                    self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+                    self.assertEqual(len(self._posts(server)), expected_posts, server.requests)
+            posts = self._posts(server)
+            self.assertEqual(len(posts), 1, "exactly one notification for the whole quiet period")
+            self.assertEqual(posts[0]["headers"].get("Title"), "nzm: idle")
+            self.assertEqual(posts[0]["headers"].get("Tags"), "idle")
+            self.assertEqual(posts[0]["body"], "proj:cc_1 is idle")
+
+    def test_core_delivers_stopped_once_after_prime(self):
+        with CaptureServer() as server, TempState() as ts:
+            config = {
+                "include_message_text": True,
+                "transports": [{"type": "ntfy", "id": "ntfy-a", "url": server.url}],
+            }
+            cfg = ts.path("config.json")
+            cfg.write_text(json.dumps(config), encoding="utf-8")
+            state = ts.path("core-state.json")
+            write_script(ts.path("bin") / "nzm", FAKE_NZM)
+            robot = {
+                "snapshot": {
+                    "generated_at": "2026-08-19T09:00:00Z",
+                    "sessions": [
+                        {
+                            "name": "proj",
+                            "status": "running",
+                            "layout_path": None,
+                            "created_at": "2026-08-18T10:00:00+00:00",
+                            "agents": [
+                                {
+                                    "id": "11111111-1111-4111-8111-111111111111",
+                                    "label": "cc_1",
+                                    "agent_type": "claude-code",
+                                    "status": "Stopped",
+                                    "zellij_pane_id": None,
+                                    "session_name": "proj",
+                                    "created_at": "2026-08-18T10:00:00+00:00",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+            activity = {
+                "version": 1,
+                "generated_at": "2026-08-19T09:00:00Z",
+                "agents": [
+                    {
+                        "subject": "proj:cc_1",
+                        "session": "proj",
+                        "agent_label": "cc_1",
+                        "agent_type": "claude-code",
+                        "probe": "unknown",
+                        "signal": "lifecycle",
+                        "observed_at": "2026-08-19T09:00:00Z",
+                        "screen_hash": None,
+                        "zellij_pane_id": None,
+                        "lifecycle": "stopped",
+                        "detail": None,
+                    }
+                ],
+            }
+            proc = self.run_core_pass(ts, cfg, state, robot, activity)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            self.assertEqual(self._posts(server), [], "first snapshot primes, does not deliver")
+            proc = self.run_core_pass(ts, cfg, state, robot, activity)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            posts = self._posts(server)
+            self.assertEqual(len(posts), 1, server.requests)
+            self.assertEqual(posts[0]["headers"].get("Title"), "nzm: stopped")
+            self.assertEqual(posts[0]["headers"].get("Tags"), "stopped")
+            self.assertEqual(posts[0]["body"], "proj:cc_1 is stopped")
+
+
 # core CLI (notifier_ng.py)
 # ---------------------------------------------------------------------------
 
@@ -2519,6 +3753,247 @@ class OmpAdapterSubjectPrivacyTests(unittest.TestCase):
             f"bun omp adapter privacy tests failed (exit {proc.returncode}):\n"
             f"{proc.stdout}\n{proc.stderr}",
         )
+
+class InstallerTimerTests(unittest.TestCase):
+    """install.py NZM managed-timer step: unit content, idempotence,
+    refusal, and PATH-resolution failure.
+
+    install.py is exercised in-process: it performs no external exec by
+    design (PATH resolution is a filesystem scan, writes go to temporary
+    unit dirs, systemctl commands are printed, never run). All unit dirs
+    and binaries are synthetic, so the assertions are deterministic
+    regardless of the ambient machine PATH.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT))
+        import install as install_mod
+        cls.install = install_mod
+
+    def setUp(self):
+        self.state = TempState()
+        self.bin_dir = self.state.path("bin")
+        for name in ("nzm", "zellij", "python3"):
+            write_script(self.bin_dir / name, "raise SystemExit(0)\n")
+        self.partial_bin = self.state.path("bin-without-zellij")
+        for name in ("nzm", "python3"):
+            write_script(self.partial_bin / name, "raise SystemExit(0)\n")
+        self.unit_dir = self.state.path("systemd", "user")
+        self.unit_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.state.cleanup()
+
+    def _run_step(self, apply=False, env_path=None):
+        plan = self.install.Plan(apply=apply)
+        with mock.patch.dict(os.environ, {"PATH": env_path or str(self.bin_dir)}):
+            self.install.step_nzm_timer(plan, self.unit_dir)
+        return plan
+
+    def _expected_units(self):
+        dirs, missing = self.install._unit_path_dirs(str(self.bin_dir))
+        self.assertIsNone(missing)
+        return self.install._nzm_units(dirs)
+
+    def _plan_text(self, plan):
+        return "\n".join(text for _kind, text in plan.lines)
+
+    def test_exec_start_and_unit_names_contract(self):
+        install = self.install
+        self.assertEqual(install.NZM_SERVICE_NAME, "notifier-ng-nzm.service")
+        self.assertEqual(install.NZM_TIMER_NAME, "notifier-ng-nzm.timer")
+        self.assertEqual(
+            install.NZM_TEMPLATE,
+            f"{install.INGEST} source {install.NZM_PLUGIN}",
+        )
+
+    def test_unit_content_is_frozen(self):
+        install = self.install
+        service, timer = install._nzm_units(["/bin-a", "/bin-b", "/bin-c"])
+        self.assertEqual(
+            service,
+            "[Unit]\n"
+            "Description=Scan NZM-registered agents for notifier-ng\n"
+            "After=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"WorkingDirectory={install.REPO}\n"
+            "Environment=PATH=/bin-a:/bin-b:/bin-c\n"
+            f"ExecStart={install.NZM_TEMPLATE}\n",
+        )
+        self.assertEqual(
+            timer,
+            "[Unit]\n"
+            "Description=Scan NZM-registered agents for notifier-ng every minute\n"
+            "\n"
+            "[Timer]\n"
+            "OnCalendar=*-*-* *:*:00\n"
+            "Persistent=true\n"
+            f"Unit={install.NZM_SERVICE_NAME}\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=timers.target\n",
+        )
+
+    def test_path_with_whitespace_is_quoted(self):
+        service, _timer = self.install._nzm_units(["/a b", "/c"])
+        self.assertIn('Environment=PATH="/a b:/c"\n', service)
+
+    def test_path_resolution_order_and_dedupe(self):
+        dirs, missing = self.install._unit_path_dirs(str(self.bin_dir))
+        self.assertIsNone(missing)
+        self.assertEqual(
+            dirs, [str(self.bin_dir), "/usr/local/bin", "/usr/bin", "/bin"]
+        )
+
+    def test_apply_writes_units_and_leaves_zellij_units_untouched(self):
+        install = self.install
+        zellij_timer = self.unit_dir / install.ZELLIJ_TIMER_NAME
+        zellij_service = self.unit_dir / "notifier-ng-zellij.service"
+        zellij_timer.write_text("legacy timer sentinel\n", encoding="utf-8")
+        zellij_service.write_text("legacy service sentinel\n", encoding="utf-8")
+        plan = self._run_step(apply=True)
+        self.assertEqual(plan.refused, 0, plan.lines)
+        expected_service, expected_timer = self._expected_units()
+        service_path = self.unit_dir / install.NZM_SERVICE_NAME
+        timer_path = self.unit_dir / install.NZM_TIMER_NAME
+        self.assertEqual(service_path.read_text(encoding="utf-8"), expected_service)
+        self.assertEqual(timer_path.read_text(encoding="utf-8"), expected_timer)
+        self.assertEqual(service_path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(timer_path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(
+            zellij_timer.read_text(encoding="utf-8"), "legacy timer sentinel\n"
+        )
+        self.assertEqual(
+            zellij_service.read_text(encoding="utf-8"), "legacy service sentinel\n"
+        )
+        text = self._plan_text(plan)
+        self.assertIn("systemctl --user daemon-reload", text)
+        self.assertIn("systemctl --user enable --now notifier-ng-nzm.timer", text)
+        self.assertIn("systemctl --user disable --now notifier-ng-zellij.timer", text)
+        blocks = [content for _kind, content in plan.lines if _kind == "block"]
+        self.assertEqual(blocks[:2], [expected_service, expected_timer])
+
+    def test_reapply_is_idempotent_noop(self):
+        install = self.install
+        first = self._run_step(apply=True)
+        self.assertEqual(first.refused, 0, first.lines)
+        service_before = (self.unit_dir / install.NZM_SERVICE_NAME).read_bytes()
+        timer_before = (self.unit_dir / install.NZM_TIMER_NAME).read_bytes()
+        second = self._run_step(apply=True)
+        self.assertEqual(second.refused, 0, second.lines)
+        unit_noops = [
+            text
+            for kind, text in second.lines
+            if kind == "noop" and "unit already installed and identical" in text
+        ]
+        self.assertEqual(len(unit_noops), 2, second.lines)
+        self.assertEqual(
+            [kind for kind, _text in second.lines if kind == "change"],
+            [],
+            "a repeated install must not re-plan any writes",
+        )
+        self.assertEqual(
+            (self.unit_dir / install.NZM_SERVICE_NAME).read_bytes(), service_before
+        )
+        self.assertEqual(
+            (self.unit_dir / install.NZM_TIMER_NAME).read_bytes(), timer_before
+        )
+
+    def test_divergent_unit_refused_never_clobbered(self):
+        install = self.install
+        service_path = self.unit_dir / install.NZM_SERVICE_NAME
+        service_path.write_text("[Unit]\nDescription=foreign unit\n", encoding="utf-8")
+        before = service_path.read_bytes()
+        plan = self._run_step(apply=True)
+        self.assertEqual(plan.refused, 1, plan.lines)
+        refusal = next(text for kind, text in plan.lines if kind == "refuse")
+        self.assertIn("notifier-ng-nzm.service", refusal)
+        self.assertIn("never clobbered", refusal)
+        self.assertEqual(service_path.read_bytes(), before)
+        expected_service, expected_timer = self._expected_units()
+        blocks = [content for _kind, content in plan.lines if _kind == "block"]
+        self.assertEqual(blocks[0], expected_service)
+        self.assertEqual(
+            (self.unit_dir / install.NZM_TIMER_NAME).read_text(encoding="utf-8"),
+            expected_timer,
+        )
+
+    def _assert_refusal_without_write(self, env_path, expected_name):
+        plan = self.install.Plan(apply=True)
+        unit_dir = self.state.path("fresh-unit-dir")
+        with mock.patch.dict(os.environ, {"PATH": env_path}):
+            self.install.step_nzm_timer(plan, unit_dir)
+        self.assertEqual(plan.refused, 1, plan.lines)
+        refusal = next(text for kind, text in plan.lines if kind == "refuse")
+        self.assertIn(f"`{expected_name}`", refusal)
+        self.assertFalse(
+            unit_dir.exists(),
+            "refusal must precede any filesystem write (directory not created)",
+        )
+        self.assertEqual(
+            [kind for kind, _text in plan.lines if kind == "block"],
+            [],
+            "no unit fragments are printed when resolution fails",
+        )
+
+    def test_unresolvable_nzm_refuses_before_any_write(self):
+        self._assert_refusal_without_write("/nonexistent", "nzm")
+
+    def test_unresolvable_zellij_refuses_before_any_write(self):
+        self._assert_refusal_without_write(str(self.partial_bin), "zellij")
+
+    def test_zellij_disable_flagged_only_when_legacy_timer_present(self):
+        install = self.install
+        plan = self._run_step(apply=False)
+        self.assertNotIn("disable --now", self._plan_text(plan))
+        (self.unit_dir / install.ZELLIJ_TIMER_NAME).write_text("legacy\n", encoding="utf-8")
+        plan = self._run_step(apply=False)
+        text = self._plan_text(plan)
+        self.assertIn("your decision", text)
+        self.assertIn("systemctl --user disable --now notifier-ng-zellij.timer", text)
+
+    def test_dry_run_pure_by_default_and_main_exit_zero(self):
+        install = self.install
+        config = self.state.path("config", "config.json")
+        state_dir = self.state.path("state")
+        omp_hooks = self.state.path("omp-hooks")
+        codex = self.state.path("codex", "config.toml")
+        hermes = self.state.path("hermes-home")
+        covey = self.state.path("state", "covey.db")
+        argv = [
+            "--config", str(config),
+            "--state-dir", str(state_dir),
+            "--omp-hooks-dir", str(omp_hooks),
+            "--codex-config", str(codex),
+            "--hermes-home", str(hermes),
+            "--covey-db", str(covey),
+            "--unit-dir", str(self.unit_dir),
+        ]
+        stdout = io.StringIO()
+        with mock.patch.dict(os.environ, {"PATH": str(self.bin_dir)}):
+            with contextlib.redirect_stdout(stdout):
+                status = install.main(argv)
+        self.assertEqual(status, 0)
+        text = stdout.getvalue()
+        self.assertNotIn("[refuse]", text)
+        self.assertIn("dry run: no changes were made", text)
+        self.assertIn("systemctl --user daemon-reload", text)
+        self.assertIn("systemctl --user enable --now notifier-ng-nzm.timer", text)
+        self.assertFalse(config.exists())
+        self.assertFalse((self.unit_dir / install.NZM_SERVICE_NAME).exists())
+        self.assertFalse((self.unit_dir / install.NZM_TIMER_NAME).exists())
+
+    def test_installer_source_has_no_process_spawning_api(self):
+        source = Path(self.install.__file__).read_text(encoding="utf-8")
+        for token in ("subprocess", "os.system(", "os.exec", "os.popen", "os.fork", "os.spawn"):
+            self.assertNotIn(
+                token, source,
+                f"install.py must never spawn a process (found {token})",
+            )
+
 
 
 if __name__ == "__main__":

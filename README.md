@@ -123,7 +123,8 @@ wires up the hooks that call it.
 ## Installation
 
 The installer (`install.py`) wires notifier-ng into the OMP, Codex, and
-Hermes harnesses in one run. It never touches your shell profile, never
+Hermes harnesses and manages the NZM source timer units in one run. It
+never touches your shell profile, never
 replaces files it does not own, and performs **zero writes by default**:
 
 ```bash
@@ -136,9 +137,11 @@ python3 install.py
 python3 install.py --apply
 ```
 
-`--apply` enables all three harness integrations together; there is no
-per-source flag. If you want only one harness wired, do not apply the
-all-harness plan: follow that adapter's manual recipe under
+`--apply` performs the whole plan (harness wiring plus writing the NZM
+timer units) together; there is no per-source flag. Activating the timer
+is a printed manual step — the installer never runs `systemctl`. If you
+want only one harness wired, do not apply the all-harness plan: follow
+that adapter's manual recipe under
 [Source plugins](#source-plugins).
 
 Application is safe and idempotent: running the installer twice reports
@@ -181,6 +184,7 @@ Customize what the installer touches with its flags:
 | `--omp-hooks-dir PATH` | `~/.omp/agent/hooks/post` | OMP hooks/post directory |
 | `--codex-config PATH` | `~/.codex/config.toml` | Codex TOML config to manage |
 | `--hermes-home PATH` | resolved (see below) | Hermes home directory |
+| `--unit-dir PATH` | `$XDG_CONFIG_HOME/systemd/user`, else `~/.config/systemd/user` | User systemd unit directory receiving the NZM timer units |
 | `--covey-db PATH` | `$XDG_STATE_HOME/notifier-ng/covey.db` | Covey database path for the printed manual scan. This default is the XDG state location, independent of `--state-dir` |
 
 When `--hermes-home` is not given, resolution is first-match-wins: the
@@ -196,7 +200,8 @@ active profile (`~/.hermes/active_profile` naming an existing
 | OMP post hook | `~/.omp/agent/hooks/post/notifier-ng.ts` | Symlinks [integrations/omp-notifier.ts](integrations/omp-notifier.ts) for harness auto-discovery; on symlink-less filesystems writes a small wrapper instead. Both forms reference this checkout: a moved checkout requires re-running the installer (see [Oh My Pi](#oh-my-pi-omp)) |
 | Codex legacy notify | `~/.codex/config.toml` | Sets the top-level `notify` array to this checkout's `notifier_ng.py source plugins/codex.py` (the array IS the argv vector of one command; Codex appends the payload JSON, which the core forwards to the plugin). Every other line is preserved byte-for-byte; no-op when the value already equals that exact array |
 | Hermes shell hooks | resolved Hermes home | Never edits an existing `config.yaml` (prints the exact fragment to merge); creates a minimal hooks-only `config.yaml` when none exists; merges allowlist entries for `on_session_end` and `on_session_finalize` using Hermes' documented schema. Hook commands route through the core so Hermes sees a no-op response on stdout |
-| Zellij / Covey scans | nothing | Prints ready-to-use manual scan commands (see [Zellij](#zellij) and [Covey](#covey)); no systemd units are added or removed and no external CLI is spawned during planning |
+| NZM source timer | `$XDG_CONFIG_HOME/systemd/user/notifier-ng-nzm.service` + `.timer` | Writes the every-minute (`OnCalendar=*-*-* *:*:00`, `Persistent=true`) user units invoking `notifier_ng.py source plugins/nzm.py` under an explicit PATH of the resolved nzm/zellij/python3/system directories; refuses before writing when `nzm` or `zellij` is unresolvable. Identical existing units are no-ops, divergent ones are refused (never clobbered); existing `notifier-ng-zellij` units are untouched. Activation is manual: the installer prints the exact `systemctl --user daemon-reload` / `enable` commands and flags the optional disable of the legacy zellij timer |
+| Zellij / Covey scans | nothing | Prints ready-to-use manual scan commands (see [Zellij](#zellij) and [Covey](#covey)); no external CLI is spawned during planning |
 
 A step that cannot be applied safely is refused, never clobbered: malformed
 existing config (bad JSON, unknown keys, broken transports, unreadable env
@@ -934,7 +939,7 @@ directories; there are no lint, format, or build steps to run.
 | Path | Contents |
 | --- | --- |
 | [notifier_ng.py](notifier_ng.py) | Core: config/state handling, event validation, dedup, redaction, summarizer orchestration, transports, CLI |
-| [install.py](install.py) | Dry-run-first installer and harness wiring (OMP hook, Codex notify, Hermes hooks, manual-command printing) |
+| [install.py](install.py) | Dry-run-first installer and harness wiring (OMP hook, Codex notify, Hermes hooks, NZM timer units, manual-command printing) |
 | [plugins/codex.py](plugins/codex.py) | Codex legacy-notify and Stop/SubagentStop hook adapter |
 | [plugins/hermes.py](plugins/hermes.py) | Hermes shell-hook adapter |
 | [plugins/covey.py](plugins/covey.py) | Read-only Covey database scan adapter |
@@ -950,9 +955,11 @@ directories; there are no lint, format, or build steps to run.
 
 ## Limitations
 
-- **No daemon, no polling.** Nothing watches or schedules; harness hooks
-  and manual scans must invoke the CLI. Zellij and Covey are snapshot scans
-  you run yourself, and no systemd units or background processes are added.
+- **No daemon, no polling.** Nothing watches or schedules; harness hooks,
+  manual scans, and the optional every-minute NZM source timer must invoke
+  the CLI. Zellij and Covey are snapshot scans you run yourself; the
+  installer only writes (never activates) the NZM timer units, and no
+  background processes are otherwise added.
 - **Two transports.** `ntfy` and `home_assistant` are the only transport
   types. Adding a transport means extending `notifier_ng.py`.
 - **Zellij cannot detect idle prompts.** Zellij exposes pane lifecycle only,

@@ -57,13 +57,32 @@ Hermes home resolution (first match wins):
   $HERMES_HOME when set
   ~/.hermes  (platform default)
 
-Zellij / Covey scans are manual: no systemd units are added or removed
-(polling is not implemented) and no external CLI is spawned during
-planning (preserving dry-run purity); the installer prints ready-to-use
-manual commands.
+  5. NZM managed timer: the user systemd units notifier-ng-nzm.service and
+     notifier-ng-nzm.timer in the user unit directory ($XDG_CONFIG_HOME/
+     systemd/user, else ~/.config/systemd/user, overridable with
+     --unit-dir). The timer fires every minute (OnCalendar=*-*-* *:*:00,
+     Persistent=true) invoking "notifier_ng.py source plugins/nzm.py" with
+     an explicit PATH built from the independently resolved absolute
+     directories of the nzm and zellij executables, the resolved python3
+     directory, and the standard system directories; the installer refuses
+     before writing when nzm or zellij cannot be resolved. Units are
+     written atomically with --apply: an identical existing file is a
+     no-op, a divergent one is refused (never clobbered; the generated
+     content is printed for comparison), and existing notifier-ng-zellij
+     units are never touched. The installer never runs systemctl: it
+     prints the exact daemon-reload / enable commands and flags the
+     optional disable of the legacy notifier-ng-zellij.timer as your
+     decision.
+
+Zellij / Covey scans are manual: polling is not implemented and no
+external CLI is spawned during planning (preserving dry-run purity); the
+installer prints ready-to-use manual commands. The NZM timer units above
+are written by --apply but never activated — activation is the printed
+systemctl commands, executed by you.
 
 Exit status: 0 = every step ok (no-ops included); 1 = a step was refused
-(broken existing config, malformed TOML/JSON target) or failed.
+(broken existing config, malformed TOML/JSON target, unresolvable
+nzm/zellij executable) or failed.
 """
 
 from __future__ import annotations
@@ -102,6 +121,20 @@ HERMES_COMMAND = f"{INGEST} source {HERMES_PLUGIN}"
 # "source" subcommand forwards to the plugin (documented codex legacy path).
 # Compare against and serialize this exact list — never a joined string.
 CODEX_NOTIFY = [INGEST, "source", CODEX_PLUGIN]
+# NZM managed timer (step 5): the core "source" subcommand forwards to the
+# plugin; both paths are repo-absolute so the generated units never depend
+# on WorkingDirectory or ambient resolution. OnCalendar/Persistent are
+# frozen contract values; the timer unit name is paired with the service.
+NZM_PLUGIN = os.path.join(REPO, "plugins", "nzm.py")
+NZM_TEMPLATE = f"{INGEST} source {NZM_PLUGIN}"
+NZM_SERVICE_NAME = "notifier-ng-nzm.service"
+NZM_TIMER_NAME = "notifier-ng-nzm.timer"
+ZELLIJ_TIMER_NAME = "notifier-ng-zellij.timer"
+# Standard system directories appended to the unit PATH after the resolved
+# binary directories (the same set NZM's own service installer uses). User
+# profile directories are reached through the resolved binary directories
+# themselves, never hardcoded.
+_STANDARD_PATH_DIRS = ("/usr/local/bin", "/usr/bin", "/bin")
 
 
 def _toml_array(items):
@@ -205,6 +238,14 @@ def default_state_dir():
         return _core.default_state_path().parent
     base = os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
     return Path(base) / "notifier-ng"
+
+def default_unit_dir():
+    """$XDG_CONFIG_HOME/systemd/user, else ~/.config/systemd/user (mirrors
+    the unit directory NZM's own service installer resolves)."""
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if base:
+        return Path(base) / "systemd" / "user"
+    return Path.home() / ".config" / "systemd" / "user"
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +769,167 @@ def step_hermes(plan, hermes_home):
 
 
 # ---------------------------------------------------------------------------
+# Step 5: NZM managed timer (notifier-ng-nzm.service + .timer)
+# ---------------------------------------------------------------------------
+
+def _find_on_path(name, env_path):
+    """First executable file named ``name`` on ``env_path``, or None.
+    Filesystem scan only: resolution never spawns a process."""
+    for directory in env_path.split(os.pathsep):
+        if not directory:
+            continue
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _unit_path_dirs(env_path):
+    """Resolve the unit PATH directories for the NZM timer units.
+
+    Each required binary (nzm, zellij) is located by its own independent
+    PATH search and pinned by the absolute path of the directory it was
+    found in, so the generated unit keeps working even when a symlinked
+    profile directory is replaced. The resolved python3 directory
+    (falling back to the interpreter actually running this installer) and
+    the standard system directories are appended after them, de-duplicated
+    in order. Returns (dirs, missing) where ``missing`` names the first
+    required binary that could not be resolved, or None.
+    """
+    parts = []
+    missing = None
+    for name in ("nzm", "zellij"):
+        found = _find_on_path(name, env_path)
+        if found is None:
+            missing = name
+            break
+        directory = os.path.dirname(os.path.abspath(found))
+        if directory and directory not in parts:
+            parts.append(directory)
+    python3 = _find_on_path("python3", env_path)
+    python_dir = (
+        os.path.dirname(os.path.abspath(python3))
+        if python3
+        else os.path.dirname(sys.executable)
+    )
+    for directory in [python_dir, *_STANDARD_PATH_DIRS]:
+        if directory and directory not in parts:
+            parts.append(directory)
+    return parts, missing
+
+
+def _quote_if_needed(value):
+    """Systemd parses Environment= with shell-like word splitting, so a PATH
+    containing whitespace is double-quoted (backslash/quote escaped inside).
+    Mirrors the escaping NZM's own service installer applies to unit PATHs."""
+    if re.search(r"\s", value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value
+
+
+def _nzm_units(path_dirs):
+    """(service, timer) unit content for a resolved directory list.
+
+    Frozen contract values emitted verbatim: ExecStart is the repo-absolute
+    core + NZM plugin command, OnCalendar is ``*-*-* *:*:00`` and
+    Persistent is true. Deterministic: identical inputs produce identical
+    bytes, which is what makes repeated installs no-ops.
+    """
+    path_value = _quote_if_needed(os.pathsep.join(path_dirs))
+    service = (
+        "[Unit]\n"
+        "Description=Scan NZM-registered agents for notifier-ng\n"
+        "After=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"WorkingDirectory={REPO}\n"
+        f"Environment=PATH={path_value}\n"
+        f"ExecStart={NZM_TEMPLATE}\n"
+    )
+    timer = (
+        "[Unit]\n"
+        "Description=Scan NZM-registered agents for notifier-ng every minute\n"
+        "\n"
+        "[Timer]\n"
+        "OnCalendar=*-*-* *:*:00\n"
+        "Persistent=true\n"
+        f"Unit={NZM_SERVICE_NAME}\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    return service, timer
+
+
+def _manage_unit(plan, path, content):
+    """Plan one unit file: identical -> noop, divergent -> refuse (never
+    clobbered; the exact generated content is printed for comparison),
+    absent -> print the exact file and create it under --apply."""
+    path = Path(path)
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        plan.refuse(f"cannot read existing unit {path}: {exc}")
+        return
+    if existing == content:
+        plan.noop(f"unit already installed and identical: {path}")
+        return
+    if existing is not None:
+        plan.refuse(
+            f"existing unit {path} differs from the generated content; "
+            "existing units are never clobbered — remove it or edit it by "
+            "hand, then re-run. Exact generated content for comparison:"
+        )
+        plan.block(content)
+        return
+    plan._tag("create", f"file {path}")
+    plan.block(content)
+    if plan.apply:
+        _atomic_write(path, content, mode=0o644)
+
+
+def step_nzm_timer(plan, unit_dir):
+    """Manage the NZM source timer units in the user unit directory.
+
+    Pure planning plus optional writes: no external CLI is ever spawned
+    (PATH resolution is filesystem scans only) and systemctl is never
+    executed — the exact daemon-reload / enable commands are printed, and
+    the legacy notifier-ng-zellij.timer is flagged as an optional disable
+    decision, never touched. Refuses before writing anything when nzm or
+    zellij cannot be resolved from PATH.
+    """
+    path_dirs, missing = _unit_path_dirs(os.environ.get("PATH", ""))
+    if missing is not None:
+        plan.refuse(
+            f"cannot resolve the `{missing}` executable on PATH; refusing to "
+            "write the NZM timer units (a unit whose ExecStart/PATH cannot "
+            f"run is worse than no unit). Install `{missing}` or add its "
+            "directory to PATH, then re-run this installer."
+        )
+        return
+    if not _ensure_dir(plan, unit_dir, "user systemd unit directory"):
+        return
+    service_content, timer_content = _nzm_units(path_dirs)
+    _manage_unit(plan, Path(unit_dir) / NZM_SERVICE_NAME, service_content)
+    _manage_unit(plan, Path(unit_dir) / NZM_TIMER_NAME, timer_content)
+    plan.manual(
+        "this installer never runs systemctl; activating the NZM timer is "
+        "your manual step after reviewing the units above:"
+    )
+    plan.block("systemctl --user daemon-reload")
+    plan.block(f"systemctl --user enable --now {NZM_TIMER_NAME}")
+    if (Path(unit_dir) / ZELLIJ_TIMER_NAME).exists():
+        plan.manual(
+            f"legacy {ZELLIJ_TIMER_NAME} is installed (left untouched); after "
+            "verifying the NZM timer delivers, disable it — your decision:"
+        )
+        plan.block(f"systemctl --user disable --now {ZELLIJ_TIMER_NAME}")
+
+
+# ---------------------------------------------------------------------------
 # Informational: manual Zellij / Covey scan commands
 # ---------------------------------------------------------------------------
 
@@ -789,6 +991,13 @@ def build_parser():
         help="hermes home (default: resolved — active profile, $HERMES_HOME, or ~/.hermes)",
     )
     parser.add_argument(
+        "--unit-dir",
+        type=str,
+        default=None,
+        help="user systemd unit directory for the NZM timer units "
+             "(default: $XDG_CONFIG_HOME/systemd/user, else ~/.config/systemd/user)",
+    )
+    parser.add_argument(
         "--covey-db",
         type=str,
         default=None,
@@ -819,6 +1028,11 @@ def main(argv=None):
         if args.covey_db
         else default_state_dir() / "covey.db"
     )
+    unit_dir = (
+        Path(args.unit_dir).expanduser()
+        if args.unit_dir
+        else default_unit_dir()
+    )
 
     if args.hermes_home:
         hermes_home, _active = Path(args.hermes_home).expanduser(), None
@@ -834,6 +1048,7 @@ def main(argv=None):
     step_omp_hook(plan, omp_hooks_dir)
     step_codex_notify(plan, codex_config)
     step_hermes(plan, hermes_home)
+    step_nzm_timer(plan, unit_dir)
     print_manual_scans(plan, covey_db)
 
     plan.emit()
